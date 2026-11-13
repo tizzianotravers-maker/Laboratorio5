@@ -240,3 +240,141 @@ void LCD_set_cursor(uint8_t col, uint8_t row) {
 	uint8_t offsets[] = {0x00, 0x40};
 	LCD_command(0x80 | (col + offsets[row]));
 }
+// INTERRUPCIONES EXTERNAS
+
+void External_Interrupts_init(void) {
+	DDRD &= ~((1 << DDD2) | (1 << DDD3));
+	PORTD |= (1 << PORTD2) | (1 << PORTD3); // Pull-up interno
+
+	EICRA = (1 << ISC11) | (1 << ISC01); // Flanco descendente
+	EIMSK = (1 << INT0) | (1 << INT1);
+}
+
+// INT0: Pulsador de evento -> reactiva sistema y reinicia inactividad
+ISR(INT0_vect) {
+	last_activity_ms = system_ms;
+	estado_actual = estado_activo;
+	buzzer_timer_ms = 80;
+}
+
+// INT1: Conmutador de estado ACTIVO / STANDBY
+ISR(INT1_vect) {
+	last_activity_ms = system_ms;
+	if (estado_actual == estado_activo) {
+		estado_actual = estado_standby;
+		} else if (estado_actual == estado_standby) {
+		estado_actual = estado_activo;
+	}
+}
+
+
+// FUNCIONES DE ESTADO DE LA FSM
+
+void estado_activo(void) {
+	uint32_t current_ms;
+	cli(); current_ms = system_ms; sei();
+
+	// Transición de entrada
+	if (ultimo_estado_ejecutado != estado_activo) {
+		LCD_backlight(1);
+		LCD_command(0x01); _delay_ms(2);
+		Buzzer_trigger(80);
+		ultimo_estado_ejecutado = estado_activo;
+	}
+
+	//  Lectura de ADC cada 100 ms
+	if (adc_trigger_flag) {
+		adc_trigger_flag = 0;
+		pot_val = ADC_read(0);
+	}
+
+	//  Parpadeo del LED cada 200 ms
+	if (current_ms - last_led_ms >= 200) {
+		last_led_ms = current_ms;
+		PORTB ^= (1 << LED_PIN);
+	}
+
+	// Lectura del Sensor DHT11 cada 2000 ms
+	if (current_ms - last_dht_ms >= 2000) {
+		last_dht_ms = current_ms;
+		if (DHT11_read(&new_hum, &new_temp)) {
+			hum = new_hum;
+			temp = new_temp;
+		}
+	}
+
+	//  Refresco de pantalla LCD cada 500 ms
+	if (current_ms - last_lcd_ms >= 500) {
+		last_lcd_ms = current_ms;
+
+		LCD_set_cursor(0, 0);
+		LCD_print("ACTIVO   T:"); LCD_print_num(temp); LCD_print("C ");
+
+		LCD_set_cursor(0, 1);
+		LCD_print("H:"); LCD_print_num(hum);
+		LCD_print("%   P:"); LCD_print_num(pot_val); LCD_print("   ");
+	}
+
+	// Evaluación de Transición de Inactividad (10 segundos)
+	if (current_ms - last_activity_ms >= 10000UL) {
+		estado_actual = estado_standby;
+	}
+}
+
+void estado_standby(void) {
+	uint32_t current_ms;
+	cli(); current_ms = system_ms; sei();
+
+	if (ultimo_estado_ejecutado != estado_standby) {
+		LCD_backlight(1);
+		LCD_command(0x01); _delay_ms(2);
+		LCD_set_cursor(0, 0); LCD_print("Esperando...");
+		LCD_set_cursor(0, 1); LCD_print("Modo STANDBY");
+		PORTB &= ~(1 << LED_PIN); // Apagar LED
+		ultimo_estado_ejecutado = estado_standby;
+	}
+
+	// Evaluación de Transición por Inactividad Global (30 segundos desde la última actividad)
+	if (current_ms - last_activity_ms >= 30000UL) {
+		estado_actual = estado_apagado;
+	}
+}
+
+void estado_apagado(void) {
+	if (ultimo_estado_ejecutado != estado_apagado) {
+		LCD_command(0x01); _delay_ms(2);
+		LCD_set_cursor(0, 0); LCD_print("Estado: APAGADO");
+		_delay_ms(500);
+		
+		LCD_command(0x01); _delay_ms(2);
+		LCD_backlight(0); // Apagar retroiluminación LCD
+		
+		PORTB &= ~(1 << LED_PIN);
+		ultimo_estado_ejecutado = estado_apagado;
+	}
+}
+
+
+// BUCLE (MAIN)
+
+int main(void) {
+	External_Interrupts_init();
+	TWI_init();
+	LCD_init();
+	ADC_init();
+	Buzzer_init();
+	Timer0_init();
+	Timer1_init();
+
+	DDRB |= (1 << LED_PIN);
+	sei();
+
+	Buzzer_trigger(100);
+	last_activity_ms = system_ms;
+
+	while (1) {
+		estado_actual();
+	}
+
+	return 0;
+}
