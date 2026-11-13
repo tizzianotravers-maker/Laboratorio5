@@ -416,3 +416,276 @@ void Bluetooth_process_rx(uint32_t now_ms) {
 		}
 	}
 }
+// INTERRUPCIONES EXTERNAS
+
+void External_Interrupts_init(void) {
+	DDRD &= ~((1 << DDD2) | (1 << DDD3));
+	PORTD |= (1 << PORTD2) | (1 << PORTD3);
+	EICRA = (1 << ISC11) | (1 << ISC01);
+	EIMSK = (1 << INT0) | (1 << INT1);
+}
+
+ISR(INT0_vect) {
+	static uint32_t last_int0_ms = 0;
+	if (system_state != STATE_APAGADO && system_ms >= 50 && (system_ms - last_int0_ms) < 50) return;
+	last_int0_ms = system_ms;
+
+	// Pulsador físico local permite despertar y recuperar de emergencia
+	emergency_locked = 0;
+	last_activity_ms = system_ms;
+	system_state = STATE_ACTIVO;
+	buzzer_timer_ms = 80;
+}
+
+ISR(INT1_vect) {
+	static uint32_t last_int1_ms = 0;
+	if (system_ms >= 50 && (system_ms - last_int1_ms) < 50) return;
+	last_int1_ms = system_ms;
+
+	if (emergency_locked) return;
+
+	last_activity_ms = system_ms;
+	if (system_state == STATE_ACTIVO) system_state = STATE_STANDBY;
+	else if (system_state == STATE_STANDBY) system_state = STATE_ACTIVO;
+}
+
+// LCD I2C DRIVER
+void TWI_init(void) {
+	TWSR = 0x00;
+	TWBR = (uint8_t)(((F_CPU / 100000UL) - 16) / 2);
+	TWCR = (1 << TWEN);
+}
+
+void TWI_start(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+	while (!(TWCR & (1 << TWINT)));
+}
+
+void TWI_stop(void) {
+	TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+
+void TWI_write(uint8_t data) {
+	TWDR = data;
+	TWCR = (1 << TWINT) | (1 << TWEN);
+	while (!(TWCR & (1 << TWINT)));
+}
+
+void LCD_backlight(uint8_t turn_on) {
+	if (turn_on) lcd_backlight_mask = 0x08;
+	else lcd_backlight_mask = 0x00;
+	TWI_start();
+	TWI_write(PCF8574_ADDR << 1);
+	TWI_write(lcd_backlight_mask);
+	TWI_stop();
+}
+
+void LCD_send_nibble(uint8_t nibble, uint8_t mode) {
+	uint8_t data = (nibble & 0xF0) | mode | lcd_backlight_mask;
+	TWI_start();
+	TWI_write(PCF8574_ADDR << 1);
+	TWI_write(data | 0x04);
+	_delay_us(1);
+	TWI_write(data & ~0x04);
+	_delay_us(50);
+	TWI_stop();
+}
+
+void LCD_command(uint8_t cmd) {
+	LCD_send_nibble(cmd & 0xF0, 0);
+	LCD_send_nibble((cmd << 4) & 0xF0, 0);
+}
+
+void LCD_data(uint8_t data) {
+	LCD_send_nibble(data & 0xF0, 1);
+	LCD_send_nibble((data << 4) & 0xF0, 1);
+}
+
+void LCD_init(void) {
+	_delay_ms(50);
+	LCD_send_nibble(0x30, 0); _delay_ms(5);
+	LCD_send_nibble(0x30, 0); _delay_us(150);
+	LCD_send_nibble(0x30, 0);
+	LCD_send_nibble(0x20, 0);
+	LCD_command(0x28);
+	LCD_command(0x0C);
+	LCD_command(0x06);
+	LCD_command(0x01);
+	_delay_ms(2);
+}
+
+void LCD_print(const char *str) {
+	while (*str) LCD_data((uint8_t)*str++);
+}
+
+void LCD_print_num(uint16_t num) {
+	char buf[6];
+	itoa(num, buf, 10);
+	LCD_print(buf);
+}
+
+void LCD_set_cursor(uint8_t col, uint8_t row) {
+	uint8_t offsets[] = {0x00, 0x40};
+	LCD_command(0x80 | (col + offsets[row]));
+}
+
+// MODOS SLEEP Y PRR
+
+void enter_sleep_standby(void) {
+	PRR |= (1 << PRADC) | (1 << PRSPI) | (1 << PRTIM2); // Apaga ADC, SPI y Timer2
+
+	cli();
+	if (system_state == STATE_STANDBY && !UART_available()) {
+		SMCR = (0 << SM2) | (0 << SM1) | (0 << SM0) | (1 << SE); // SLEEP_MODE_IDLE
+		sei();
+		sleep_cpu();
+		SMCR &= ~(1 << SE);
+		} else {
+		sei();
+	}
+
+	PRR = (1 << PRSPI) | (1 << PRTIM2);
+}
+
+void enter_sleep_apagado(void) {
+	UART_flush_tx();
+	wdt_disable();
+	ADCSRA &= ~(1 << ADEN);
+
+	PRR = 0xEF;
+
+	cli();
+	if (system_state == STATE_APAGADO) {
+		SMCR = (0 << SM2) | (1 << SM1) | (0 << SM0) | (1 << SE); // SLEEP_MODE_PWR_DOWN
+		sei();
+		sleep_cpu();
+		SMCR &= ~(1 << SE);
+		} else {
+		sei();
+	}
+
+	//El microcontrolador duerme aquí hasta interrupción externa
+
+	PRR = (1 << PRSPI) | (1 << PRTIM2);
+	ADCSRA |= (1 << ADEN);
+	WDT_enable_reset_2s();
+}
+
+// BUCLE PRINCIPAL
+int main(void) {
+	UART_init();
+	External_Interrupts_init();
+	TWI_init();
+	LCD_init();
+	ADC_init();
+	Buzzer_init();
+	Timer0_init();
+	Timer1_init();
+
+	DDRB |= (1 << LED_PIN);
+	sei();
+
+	PRR = (1 << PRSPI) | (1 << PRTIM2);
+	WDT_enable_reset_2s();
+
+	Buzzer_trigger(100);
+
+	uint8_t last_state = 0xFF;
+	uint8_t new_temp = 0, new_hum = 0;
+	uint32_t last_led_ms = 0, last_lcd_ms = 0, last_dht_ms = 0;
+
+	cli();
+	last_activity_ms = system_ms;
+	sei();
+
+	while (1) {
+		wdt_reset(); // Refresco continuo del WDT (Prueba B)
+
+		uint32_t current_ms, activity_ms;
+		cli();
+		current_ms = system_ms;
+		activity_ms = last_activity_ms;
+		sei();
+
+		// Procesar tramas Bluetooth fuera de la ISR
+		Bluetooth_process_rx(current_ms);
+
+		uint32_t inactivity_ms = (current_ms >= activity_ms) ? (current_ms - activity_ms) : 0;
+
+		if (!emergency_locked) {
+			if (inactivity_ms >= 30000UL) {
+				system_state = STATE_APAGADO;
+				} else if (inactivity_ms >= 10000UL && system_state == STATE_ACTIVO) {
+				system_state = STATE_STANDBY;
+			}
+		}
+
+		if (system_state == STATE_ACTIVO) {
+			if (last_state != STATE_ACTIVO) {
+				LCD_backlight(1);
+				LCD_command(0x01); _delay_ms(2);
+				Buzzer_trigger(80);
+				UART_send_frame(CMD_EVENT_NOTIFY, STATE_ACTIVO);
+				last_state = STATE_ACTIVO;
+			}
+
+			if (adc_trigger_flag) {
+				adc_trigger_flag = 0;
+				pot_val = ADC_read(0);
+			}
+
+			if (current_ms - last_led_ms >= 200) {
+				last_led_ms = current_ms;
+				PORTB ^= (1 << LED_PIN);
+			}
+
+			if (current_ms - last_dht_ms >= 2000) {
+				last_dht_ms = current_ms;
+				if (DHT11_read(&new_hum, &new_temp)) {
+					hum_val = new_hum;
+					temp_val = new_temp;
+				}
+			}
+
+			if (current_ms - last_lcd_ms >= 500) {
+				last_lcd_ms = current_ms;
+				LCD_set_cursor(0, 0);
+				LCD_print("ACTIVO   T:"); LCD_print_num(temp_val); LCD_print("C ");
+
+				LCD_set_cursor(0, 1);
+				LCD_print("H:"); LCD_print_num(hum_val);
+				LCD_print("%   P:"); LCD_print_num(pot_val); LCD_print("   ");
+			}
+		}
+		else if (system_state == STATE_STANDBY) {
+			if (last_state != STATE_STANDBY) {
+				LCD_backlight(1);
+				LCD_command(0x01); _delay_ms(2);
+				LCD_set_cursor(0, 0); LCD_print("Esperando...");
+				LCD_set_cursor(0, 1); LCD_print("Modo STANDBY");
+				PORTB &= ~(1 << LED_PIN);
+				UART_send_frame(CMD_EVENT_NOTIFY, STATE_STANDBY);
+				last_state = STATE_STANDBY;
+			}
+			enter_sleep_standby();
+		}
+		else if (system_state == STATE_APAGADO) {
+			if (last_state != STATE_APAGADO) {
+				LCD_command(0x01); _delay_ms(2);
+				LCD_set_cursor(0, 0);
+				if (emergency_locked) LCD_print("ESTADO SEGURO!");
+				else LCD_print("Estado: APAGADO");
+				UART_send_frame(CMD_EVENT_NOTIFY, STATE_APAGADO);
+				_delay_ms(500);
+				
+				LCD_command(0x01); _delay_ms(2);
+				LCD_backlight(0);
+				PORTB &= ~(1 << LED_PIN);
+				last_state = STATE_APAGADO;
+			}
+			enter_sleep_apagado();
+		}
+	}
+
+	return 0;
+}
